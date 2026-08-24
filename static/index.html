@@ -10,10 +10,12 @@
     #micBtn.active { background: #dc3545; }
     #micBtn:disabled { background: #9aa4ad; cursor: not-allowed; }
     #status { margin-top: 14px; font-size: 14px; color: #555; min-height: 20px; }
+    #status.speaking { color: #b45309; font-weight: 600; }
     #log { margin-top: 25px; white-space: pre-wrap; text-align: left; max-width: 600px; margin-inline: auto;
            background: white; padding: 15px; border-radius: 8px; max-height: 50vh; overflow-y: auto; }
     #warning { display: none; max-width: 600px; margin: 20px auto; background: #fff3cd; color: #664d03;
                padding: 12px; border-radius: 8px; font-size: 14px; }
+    #note { max-width: 600px; margin: 14px auto 0; font-size: 12px; color: #6b7280; line-height: 1.5; }
   </style>
 </head>
 <body>
@@ -22,6 +24,10 @@
   <button id="micBtn">কল শুরু করুন (Start Call)</button>
   <div id="status">সিস্টেম প্রস্তুত...</div>
   <div id="log"></div>
+  <p id="note">
+    এই লাইনটি হাফ-ডুপ্লেক্স: AI যখন বলছে তখন আপনার মাইক বন্ধ থাকে, তাই মাঝপথে থামানো যাবে না।
+    AI-এর কথা শেষ হলে বলুন।
+  </p>
 
   <script>
     const btn = document.getElementById('micBtn');
@@ -30,8 +36,17 @@
     const warningEl = document.getElementById('warning');
 
     const MIME_TYPE = 'audio/webm';
+
+    // Delay between the last clip ending and the mic reopening. Speakers
+    // and small rooms keep ringing for a moment after the waveform stops;
+    // reopening on the exact sample boundary lets that tail back into the
+    // buffer, which is the same self-hearing problem the mute exists to
+    // solve, just smaller.
+    const POST_PLAYBACK_GUARD_MS = 250;
+
     let ws, mediaRecorder, audioContext, stream;
     let playQueue = Promise.resolve();
+    let pendingClips = 0;
     let inCall = false;
 
     if (!('MediaRecorder' in window) || !MediaRecorder.isTypeSupported(MIME_TYPE)) {
@@ -51,22 +66,52 @@
       log.scrollTop = log.scrollHeight;
     }
 
+    // track.enabled = false, NOT mediaRecorder.pause(). The track keeps
+    // producing frames (of digital silence), so the WebM timeline the
+    // server slices utterances out of keeps advancing at real time.
+    // Pausing the recorder would make recorded-time and wall-clock diverge,
+    // and every processed_until_s offset on the server would drift.
+    function setMicMuted(muted) {
+      if (!stream) return;
+      stream.getAudioTracks().forEach((t) => { t.enabled = !muted; });
+    }
+
+    function onPlaybackIdle() {
+      if (pendingClips !== 0 || !inCall) return;
+      setMicMuted(false);
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'playback_done' }));
+      }
+      statusEl.classList.remove('speaking');
+      statusEl.textContent = 'শুনছি...';
+    }
+
     function playAudio(arrayBuffer) {
+      pendingClips += 1;
+      setMicMuted(true);
+      statusEl.classList.add('speaking');
+      statusEl.textContent = 'AI বলছে... (মাইক বন্ধ)';
+
       playQueue = playQueue.then(() => new Promise(async (resolve) => {
         try {
           if (!audioContext) audioContext = new (window.AudioContext || window.webkitAudioContext)();
+          if (audioContext.state === 'suspended') await audioContext.resume();
           const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
           const source = audioContext.createBufferSource();
           source.buffer = audioBuffer;
           source.connect(audioContext.destination);
           source.onended = resolve;
-          statusEl.textContent = 'AI বলছে...';
           source.start();
         } catch (e) {
           console.error('audio decode failed', e);
           resolve();
         }
-      })).then(() => { if (inCall) statusEl.textContent = 'শুনছি...'; });
+      })).then(() => {
+        pendingClips -= 1;
+        // Only the LAST clip in a burst reopens the mic -- otherwise the
+        // gap between two queued replies would unmute mid-sentence.
+        if (pendingClips === 0) setTimeout(onPlaybackIdle, POST_PLAYBACK_GUARD_MS);
+      });
     }
 
     async function startCall() {
@@ -96,6 +141,7 @@
         };
         mediaRecorder.start(250);
         inCall = true;
+        pendingClips = 0;
         btn.textContent = 'কল শেষ করুন (End Call)';
         btn.classList.add('active');
         statusEl.textContent = 'শুনছি...';
@@ -117,11 +163,14 @@
 
     function endCall() {
       inCall = false;
+      pendingClips = 0;
+      setMicMuted(false);
       if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
       if (stream) stream.getTracks().forEach((t) => t.stop());
       if (ws && ws.readyState === WebSocket.OPEN) ws.close();
       btn.textContent = 'কল শুরু করুন (Start Call)';
       btn.classList.remove('active');
+      statusEl.classList.remove('speaking');
       statusEl.textContent = 'কল শেষ হয়েছে।';
     }
 

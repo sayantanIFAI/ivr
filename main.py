@@ -2,9 +2,11 @@
 
 Turn loop, once a caller's utterance is judged complete (agent/vad_stream.py):
 
-  utterance WAV -> ASR (agent/asr.py, reused voicerx IndicConformer)
-                -> intent+slots (agent/llm.py, Ollama JSON-mode)
-                -> Spring Boot lookup (agent/tools_client.py)
+  utterance WAV -> ASR (agent/asr.py, IndicConformer)
+                -> intent+slots (agent/llm.py, Ollama JSON-mode,
+                   fronted by agent/semantic_cache.py)
+                -> Spring Boot lookup (agent/tools_client.py) -- ALWAYS
+                   live, never cached; see semantic_cache.py's docstring
                 -> reply text, TEMPLATED from the API response, never
                    restated by the model (agent/reply_templates.py)
                 -> TTS (agent/tts.py) -> WAV bytes back over the socket
@@ -14,17 +16,49 @@ gets dead air: ASR-empty, LLM-failure, tool-failure and TTS-failure each
 speak a distinct, pre-recorded apology rather than the process hanging or
 the socket just going quiet. See README.md "Error handling" for the full
 table and the reasoning behind each choice.
+
+HALF-DUPLEX GATE
+----------------
+The mic is open for the entire call, and the agent's replies play out of
+the caller's speaker. With no gate, the agent hears itself: its own
+greeting lands in the same buffer the turn detector is watching, so VAD
+fires a "the caller finished talking" on the agent's own voice, ASR
+transcribes the agent, and processed_until_s advances past audio the
+caller never produced. That is a self-sustaining loop, and it is what
+made real calls cut the caller off in the first second and then run a
+turn behind for the rest of the call.
+
+Browser echoCancellation does not save this. It is built to cancel a
+remote WebRTC peer's rendered stream; here the audio is synthesized
+locally and played through Web Audio, which the canceller never sees as a
+far-end reference.
+
+So the pipeline is explicitly half-duplex, gated from BOTH ends:
+  * client mutes the mic track while agent audio is playing (static/
+    index.html) -- the track stays live and keeps emitting, so the WebM
+    timeline never breaks, it just carries silence;
+  * server refuses to run turn detection while `agent_speaking`, then
+    resynchronizes processed_until_s past the muted region once playback
+    is confirmed finished.
+
+The cost is no barge-in: a caller cannot interrupt the agent mid-sentence.
+That is a real limitation, chosen deliberately over the alternative, which
+was a system that interrupted ITSELF. Supporting barge-in properly needs
+an acoustic echo canceller with the played audio as a reference signal
+(WebRTC APM or speex AEC), which is a much larger change.
 """
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import io
 import json
 import logging
 import os
 import tempfile
 import time
 import uuid
+import wave
 
 import torchaudio
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -35,6 +69,7 @@ from agent.llm import extract_intent, ExtractionError
 from agent.reply_templates import (
     missing_slot_prompt, test_rate_reply, doctor_availability_reply, booking_reply,
 )
+from agent.semantic_cache import SemanticCache, embed as _embed_probe
 from agent.tools_client import ClinicToolsClient, ToolCallError
 from agent.tts import TTSClient
 from agent.vad_stream import TurnDetector
@@ -54,6 +89,19 @@ UTTERANCE_PAD_S = 0.15  # small trailing pad so ASR doesn't clip the last phonem
 # flowing on the socket so no proxy in between decides it's abandoned.
 HEARTBEAT_INTERVAL_S = 15.0
 
+# Backstop for the half-duplex gate. Normally the client reports playback
+# finished and the gate lifts immediately; this only fires when that
+# message never arrives (JS error, stale cached page, a client that
+# predates the control channel). Generous on purpose -- lifting the gate
+# early puts the agent back to hearing itself, which is the bug.
+PLAYBACK_GUARD_S = 3.0
+
+# On resync, rewind slightly before the buffer's decoded end. The region
+# being skipped is muted silence, so rewinding into it costs nothing,
+# while NOT rewinding risks clipping the caller's first syllable if the
+# WebM decode is running a beat behind real time.
+RESYNC_REWIND_S = 0.25
+
 CLINIC_API_BASE = os.environ.get("CLINIC_API_BASE", "http://localhost:8080")
 
 app = FastAPI()
@@ -63,17 +111,33 @@ _asr: TurnASR | None = None
 _turn_detector: TurnDetector | None = None
 _tools: ClinicToolsClient | None = None
 _tts: TTSClient | None = None
+_intent_cache: SemanticCache | None = None
 
 
 @app.on_event("startup")
 async def _startup():
-    global _asr, _turn_detector, _tools, _tts
-    logger.info("loading IndicConformer (shared with voicerx)...")
+    global _asr, _turn_detector, _tools, _tts, _intent_cache
+    logger.info("loading IndicConformer...")
     _asr = await asyncio.to_thread(TurnASR)
     logger.info("loading Silero VAD...")
     _turn_detector = await asyncio.to_thread(TurnDetector)
     _tools = ClinicToolsClient(CLINIC_API_BASE)
     _tts = TTSClient()
+    _intent_cache = SemanticCache()
+
+    # Pull bge-m3 into VRAM before the first caller needs it. Cold-loading
+    # it inside a live turn measured past the client's patience AND past
+    # the embed timeout, which silently degraded the cache to exact-match
+    # only for the opening minutes of the process -- healthy-looking logs,
+    # zero semantic hits. OLLAMA_KEEP_ALIVE=-1 keeps it resident after.
+    try:
+        await asyncio.to_thread(_embed_probe, "warmup")
+        logger.info("embedding model warm")
+    except Exception as e:  # noqa: BLE001 - cache is optional, the call is not
+        logger.warning("embedding warmup failed, cache starts L1-only: %s", e)
+
+    logger.info("prewarming TTS...")
+    await _tts.prewarm()
     logger.info("startup complete -- ready for calls")
 
 
@@ -94,12 +158,35 @@ async def health():
     }
 
 
+@app.get("/api/stats")
+async def stats():
+    """Cache effectiveness, for tuning the similarity threshold against
+    real traffic rather than against my assumptions about it."""
+    return {
+        "intent_cache": _intent_cache.snapshot() if _intent_cache else None,
+        "tts_cache": _tts.snapshot() if _tts else None,
+    }
+
+
+def _wav_duration_s(wav_bytes: bytes) -> float:
+    try:
+        with contextlib.closing(wave.open(io.BytesIO(wav_bytes), "rb")) as w:
+            return w.getnframes() / float(w.getframerate())
+    except Exception:  # noqa: BLE001 - a fallback clip may not be canonical WAV
+        return 5.0
+
+
 async def _decode_to_wav(raw_path: str, wav_path: str) -> bool:
     """Re-decode the WHOLE growing webm buffer every poll -- same choice
     server.py makes for the consultation recorder, and for the same reason:
     MediaRecorder only puts the container header on the FIRST chunk, so
     later chunks are not independently decodable, and re-decoding a few
-    seconds of audio is cheap next to ASR+LLM+TTS."""
+    seconds of audio is cheap next to ASR+LLM+TTS.
+
+    NOTE the cost profile: this is O(call length) on every poll, so the
+    work per poll grows for the whole duration of a call. Fine for a
+    handful of concurrent bench calls; it is the first thing that has to
+    change for real concurrency (see README.md "Scaling")."""
     proc = await asyncio.create_subprocess_exec(
         "ffmpeg", "-y", "-loglevel", "error", "-i", raw_path,
         "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", wav_path,
@@ -140,6 +227,27 @@ class CallSession:
         self.wav_path = self.raw_path + ".wav"
         open(self.raw_path, "wb").close()
 
+        # Starts True: the greeting goes out before the caller has said
+        # anything, so the gate must already be closed when the first poll
+        # tick runs, not opened a moment later by _speak().
+        self.agent_speaking = True
+        self.speak_deadline = time.time() + PLAYBACK_GUARD_S
+        self.resync_pending = False
+
+    def hold_gate_for(self, audio_duration_s: float):
+        """Called before each reply goes out. Extends rather than replaces
+        the deadline: replies queue on the client, so a second clip starts
+        playing only after the first finishes."""
+        base = max(self.speak_deadline, time.time()) if self.agent_speaking else time.time()
+        self.agent_speaking = True
+        self.speak_deadline = base + audio_duration_s + PLAYBACK_GUARD_S
+
+    def release_gate(self):
+        """Playback is over. Don't touch processed_until_s here -- the poll
+        loop owns the decoded buffer and does the resync on its next tick."""
+        self.agent_speaking = False
+        self.resync_pending = True
+
     async def append(self, chunk: bytes):
         self.last_activity = time.time()
         with open(self.raw_path, "ab") as f:
@@ -165,6 +273,11 @@ async def _speak(session: CallSession, text_bn: str, fallback_reason: str | None
     except Exception as e:  # noqa: BLE001 - TTS is the last mile, must not raise past here
         logger.warning("[%s] TTS failed (%s) -- using fallback audio", session.call_id, e)
         wav = _tts.fallback_audio(fallback_reason or "tts_failure")
+
+    # Close the gate BEFORE the bytes leave, never after: the client can
+    # start playing the moment they land, and a poll tick that slips in
+    # between send and gate is exactly the echo this prevents.
+    session.hold_gate_for(_wav_duration_s(wav))
     await session.send_audio(wav)
 
 
@@ -177,6 +290,22 @@ async def _slice_utterance(session: CallSession, start_s: float, end_s: float, s
     clip_path = f"{session.wav_path}.utt{seq}.wav"
     await asyncio.to_thread(torchaudio.save, clip_path, wav[:, a:b], sr)
     return clip_path
+
+
+async def _resolve_intent(session: CallSession, text: str) -> dict:
+    """Semantic cache in front of the LLM. A hit skips Ollama entirely --
+    the slowest hop in the turn -- but the clinic lookup that follows still
+    runs live, so a cached intent can never serve a stale price."""
+    cached, how = await asyncio.to_thread(_intent_cache.get, text)
+    if cached is not None:
+        logger.info("[%s] intent cache %s hit", session.call_id, how)
+        return cached
+
+    data, diag = await asyncio.to_thread(extract_intent, text)
+    logger.info("[%s] intent extracted in %.2fs (%d attempt(s))",
+                session.call_id, diag["total_time_s"], diag["attempts"])
+    await asyncio.to_thread(_intent_cache.put, text, data)
+    return data
 
 
 async def _dispatch_turn(session: CallSession, utterance_wav: str):
@@ -198,7 +327,7 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str):
         await session.send_json("User", text)
 
         try:
-            data, _diag = await asyncio.to_thread(extract_intent, text)
+            data = await _resolve_intent(session, text)
         except ExtractionError as e:
             logger.error("[%s] intent extraction failed: %s", session.call_id, e)
             await _speak(session, "একটু সমস্যা হচ্ছে, একটু ধরুন।", fallback_reason="llm_failure")
@@ -247,6 +376,24 @@ async def _dispatch_turn(session: CallSession, utterance_wav: str):
                          fallback_reason="tool_failure")
 
 
+async def _resync_after_playback(session: CallSession) -> bool:
+    """Drop everything captured while the agent was talking, by moving
+    processed_until_s to the current end of the decoded buffer. That region
+    is muted silence from the client's side; skipping it keeps the turn
+    detector from ever analysing it, and -- more importantly -- keeps
+    processed_until_s anchored to real time instead of drifting a full
+    reply behind, which is what made later turns surface late."""
+    if not await _decode_to_wav(session.raw_path, session.wav_path):
+        return False
+    wav, sr = await asyncio.to_thread(torchaudio.load, session.wav_path)
+    buffer_end_s = wav.shape[-1] / sr
+    session.processed_until_s = max(session.processed_until_s,
+                                    buffer_end_s - RESYNC_REWIND_S)
+    session.resync_pending = False
+    logger.info("[%s] resynced to %.2fs after playback", session.call_id, session.processed_until_s)
+    return True
+
+
 async def _turn_poll_loop(session: CallSession):
     """Runs for the lifetime of the call. Every POLL_INTERVAL_S, re-decodes
     the growing buffer -- ALWAYS from byte 0, since that's the only way
@@ -272,6 +419,18 @@ async def _turn_poll_loop(session: CallSession):
             with contextlib.suppress(Exception):
                 await session.ws.send_text('{"sender":"_ping","text":""}')
 
+        # --- half-duplex gate: never run turn detection on our own voice ---
+        if session.agent_speaking:
+            if time.time() < session.speak_deadline:
+                continue
+            logger.warning("[%s] no playback-done from client, releasing gate on deadline",
+                           session.call_id)
+            session.release_gate()
+
+        if session.resync_pending:
+            await _resync_after_playback(session)
+            continue
+
         if not await _decode_to_wav(session.raw_path, session.wav_path):
             continue  # too little data yet to form a valid container -- not an error
 
@@ -294,6 +453,19 @@ async def _turn_poll_loop(session: CallSession):
         asyncio.create_task(_dispatch_turn(session, utterance_wav))
 
 
+async def _handle_control(session: CallSession, raw: str):
+    """Client -> server control channel. Only one message today, but it is
+    the load-bearing half of the echo gate: the server cannot otherwise
+    know when the caller's speaker actually stopped."""
+    try:
+        msg = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("[%s] unparseable control frame: %r", session.call_id, raw[:80])
+        return
+    if msg.get("type") == "playback_done":
+        session.release_gate()
+
+
 @app.websocket("/ws/audio")
 async def ws_audio(ws: WebSocket):
     await ws.accept()
@@ -307,8 +479,10 @@ async def ws_audio(ws: WebSocket):
             message = await ws.receive()
             if message["type"] == "websocket.disconnect":
                 break
-            if "bytes" in message and message["bytes"] is not None:
+            if message.get("bytes") is not None:
                 await session.append(message["bytes"])
+            elif message.get("text"):
+                await _handle_control(session, message["text"])
     except WebSocketDisconnect:
         pass
     except Exception:

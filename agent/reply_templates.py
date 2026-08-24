@@ -15,6 +15,31 @@ direct_reply_bn -- there is no fact to get wrong in "নমস্কার" or "
 from __future__ import annotations
 
 
+def _spoken_test_name(slots: dict, result: dict) -> str:
+    """What the caller HEARS as the test's name.
+
+    Order matters. The API's `test_name` is the catalogue's English label
+    ("Uric Acid") and the Bengali TTS tokenizer drops Latin script
+    outright, so putting it in a spoken sentence removes the name from the
+    reply entirely -- the caller hears a price attached to nothing. Prefer
+    the seeded Bengali alias; failing that, echo the caller's own words
+    back, which is what a person at the counter would do anyway.
+    """
+    return (result.get("test_name_bn")
+            or slots.get("test_name")
+            or result.get("test_name")
+            or "টেস্ট")
+
+
+def _spoken_doctor_name(slots: dict, result: dict) -> str:
+    """Same problem, same order. Aliases are seeded as surnames ("সেন"),
+    so this adds the honorific the English label already carried."""
+    alias = result.get("doctor_name_bn")
+    if alias:
+        return f"ডাঃ {alias}"
+    return slots.get("doctor_name") or result.get("doctor_name") or "ডাক্তার"
+
+
 def missing_slot_prompt(intent: str, missing: str) -> str:
     prompts = {
         ("test_rate", "test_name"): "কোন টেস্টের রেট জানতে চান, একটু বলবেন?",
@@ -36,7 +61,7 @@ def test_rate_reply(slots: dict, result: dict) -> str:
         return f"দুঃখিত, '{slots.get('test_name')}' নামে কোনো টেস্ট আমাদের তালিকায় নেই।"
 
     rate = result["rate_inr"]
-    name = result["test_name"]
+    name = _spoken_test_name(slots, result)
     sample = result.get("sample_type")
     hours = result.get("report_time_hours")
     reply = f"{name} টেস্টের রেট {rate} টাকা।"
@@ -51,7 +76,7 @@ def doctor_availability_reply(slots: dict, result: dict) -> str:
     if not result.get("found"):
         return f"দুঃখিত, '{slots.get('doctor_name')}' নামে কোনো ডাক্তার আমাদের এখানে নেই।"
 
-    name = result["doctor_name"]
+    name = _spoken_doctor_name(slots, result)
     if result.get("available"):
         hours = result.get("chamber_hours", "")
         date_txt = f" {result.get('date')} তারিখে" if result.get("date") else " আজ"
@@ -66,7 +91,7 @@ def doctor_availability_reply(slots: dict, result: dict) -> str:
 def booking_reply(slots: dict, result: dict) -> str:
     if result.get("success"):
         return (f"আপনার অ্যাপয়েন্টমেন্ট কনফার্ম হয়েছে। "
-                f"ডাক্তার {result['doctor_name']}, {result['date']}, সময় {result['time_slot']}। "
+                f"{_spoken_doctor_name(slots, result)}, {result['date']}, সময় {result['time_slot']}। "
                 f"কনফার্মেশন নম্বর: {result['confirmation_id']}।")
 
     reason = result.get("reason")

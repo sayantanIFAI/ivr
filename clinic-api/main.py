@@ -41,9 +41,22 @@ def health(db: Session = Depends(get_db)):
 # =============================================================================
 # Tool 1: GET /api/v1/tests/search?name=...
 # =============================================================================
+def _first_alias_bn(aliases_bn: str) -> str | None:
+    """The spoken form. The reply the caller HEARS is synthesized by a
+    Bengali-only tokenizer that silently drops Latin script, so returning
+    only `t.name` ("Uric Acid") means the caller is read a price with the
+    test name missing from the sentence. Every row is seeded with at least
+    one Bengali alias for exactly this reason -- see seed.py."""
+    for alias in (aliases_bn or "").split("|"):
+        if alias.strip():
+            return alias.strip()
+    return None
+
+
 def _test_reply_dict(t: LabTest) -> dict:
     return {
-        "found": True, "test_name": t.name, "rate_inr": t.rate_inr,
+        "found": True, "test_name": t.name, "test_name_bn": _first_alias_bn(t.aliases_bn),
+        "rate_inr": t.rate_inr,
         "sample_type": t.sample_type, "report_time_hours": t.report_time_hours,
     }
 
@@ -166,13 +179,15 @@ def doctor_availability(name: str = Query(...), date: str | None = Query(None),
         sched = _schedule_for_weekday(db, doctor.id, target.weekday())
         if sched:
             return {
-                "found": True, "doctor_name": doctor.name, "date": target.isoformat(),
+                "found": True, "doctor_name": doctor.name,
+                "doctor_name_bn": _first_alias_bn(doctor.aliases_bn), "date": target.isoformat(),
                 "available": True, "chamber_hours": f"{sched.start_time}-{sched.end_time}",
                 "next_available_date": None,
             }
         next_date = _next_available_date(db, doctor.id, target + datetime.timedelta(days=1))
         return {
-            "found": True, "doctor_name": doctor.name, "date": target.isoformat(),
+            "found": True, "doctor_name": doctor.name,
+                "doctor_name_bn": _first_alias_bn(doctor.aliases_bn), "date": target.isoformat(),
             "available": False, "chamber_hours": None, "next_available_date": next_date,
         }
 
@@ -180,12 +195,14 @@ def doctor_availability(name: str = Query(...), date: str | None = Query(None),
     next_date = _next_available_date(db, doctor.id, today)
     if not next_date:
         return {
-            "found": True, "doctor_name": doctor.name, "date": None,
+            "found": True, "doctor_name": doctor.name,
+                "doctor_name_bn": _first_alias_bn(doctor.aliases_bn), "date": None,
             "available": False, "chamber_hours": None, "next_available_date": None,
         }
     sched = _schedule_for_weekday(db, doctor.id, datetime.date.fromisoformat(next_date).weekday())
     return {
-        "found": True, "doctor_name": doctor.name, "date": next_date,
+        "found": True, "doctor_name": doctor.name,
+                "doctor_name_bn": _first_alias_bn(doctor.aliases_bn), "date": next_date,
         "available": True, "chamber_hours": f"{sched.start_time}-{sched.end_time}",
         "next_available_date": None,
     }
@@ -255,5 +272,6 @@ def book_appointment(req: BookingRequest, db: Session = Depends(get_db)):
 
     return {
         "success": True, "confirmation_id": confirmation_id,
-        "doctor_name": doctor.name, "date": req.date, "time_slot": req.time_slot,
+        "doctor_name": doctor.name,
+        "doctor_name_bn": _first_alias_bn(doctor.aliases_bn), "date": req.date, "time_slot": req.time_slot,
     }

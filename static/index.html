@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="bn">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Kolkata Care AI Voice Assistant</title>
+  <style>
+    body { font-family: sans-serif; text-align: center; padding: 40px 16px; background: #f4f6f8; }
+    #micBtn { font-size: 18px; padding: 15px 30px; border-radius: 30px; border: none; cursor: pointer; background: #007bff; color: white; }
+    #micBtn.active { background: #dc3545; }
+    #micBtn:disabled { background: #9aa4ad; cursor: not-allowed; }
+    #status { margin-top: 14px; font-size: 14px; color: #555; min-height: 20px; }
+    #log { margin-top: 25px; white-space: pre-wrap; text-align: left; max-width: 600px; margin-inline: auto;
+           background: white; padding: 15px; border-radius: 8px; max-height: 50vh; overflow-y: auto; }
+    #warning { display: none; max-width: 600px; margin: 20px auto; background: #fff3cd; color: #664d03;
+               padding: 12px; border-radius: 8px; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <h2>কলকাতা কেয়ার ডায়াগনস্টিকস (Kolkata Care AI)</h2>
+  <div id="warning"></div>
+  <button id="micBtn">কল শুরু করুন (Start Call)</button>
+  <div id="status">সিস্টেম প্রস্তুত...</div>
+  <div id="log"></div>
+
+  <script>
+    const btn = document.getElementById('micBtn');
+    const statusEl = document.getElementById('status');
+    const log = document.getElementById('log');
+    const warningEl = document.getElementById('warning');
+
+    const MIME_TYPE = 'audio/webm';
+    let ws, mediaRecorder, audioContext, stream;
+    let playQueue = Promise.resolve();
+    let inCall = false;
+
+    if (!('MediaRecorder' in window) || !MediaRecorder.isTypeSupported(MIME_TYPE)) {
+      // Known, real limitation: Safari/iOS does not support MediaRecorder
+      // with audio/webm at all. This bench client needs Chrome, Edge, or
+      // Firefox until a WebM-free capture path is built for iOS callers.
+      warningEl.style.display = 'block';
+      warningEl.textContent =
+        'এই ব্রাউজারে মাইক্রোফোন ক্যাপচার সাপোর্টেড নয় (Safari/iOS-এ কাজ করবে না)। Chrome, Edge, বা Firefox ব্যবহার করুন।';
+      btn.disabled = true;
+    }
+
+    function appendLog(sender, text) {
+      const line = document.createElement('div');
+      line.textContent = `[${sender}] ${text}`;
+      log.appendChild(line);
+      log.scrollTop = log.scrollHeight;
+    }
+
+    function playAudio(arrayBuffer) {
+      playQueue = playQueue.then(() => new Promise(async (resolve) => {
+        try {
+          if (!audioContext) audioContext = new (window.AudioContext || window.webkitAudioContext)();
+          const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+          const source = audioContext.createBufferSource();
+          source.buffer = audioBuffer;
+          source.connect(audioContext.destination);
+          source.onended = resolve;
+          statusEl.textContent = 'AI বলছে...';
+          source.start();
+        } catch (e) {
+          console.error('audio decode failed', e);
+          resolve();
+        }
+      })).then(() => { if (inCall) statusEl.textContent = 'শুনছি...'; });
+    }
+
+    async function startCall() {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+        });
+      } catch (e) {
+        statusEl.textContent = 'মাইক্রোফোন ব্লক করা আছে: ' + e.message;
+        return;
+      }
+
+      const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      ws = new WebSocket(`${wsProtocol}//${window.location.host}/ws/audio`);
+      ws.binaryType = 'arraybuffer';
+
+      ws.onopen = () => {
+        mediaRecorder = new MediaRecorder(stream, { mimeType: MIME_TYPE });
+        // Continuous small chunks -- the server-side turn detector decides
+        // when an utterance is complete, not this button. See main.py's
+        // TurnDetector: the mic stays open for the whole call, like a real
+        // phone line, not a single push-to-talk press.
+        mediaRecorder.ondataavailable = (e) => {
+          if (e.data.size > 0 && ws.readyState === WebSocket.OPEN) {
+            e.data.arrayBuffer().then((buf) => ws.send(buf));
+          }
+        };
+        mediaRecorder.start(250);
+        inCall = true;
+        btn.textContent = 'কল শেষ করুন (End Call)';
+        btn.classList.add('active');
+        statusEl.textContent = 'শুনছি...';
+      };
+
+      ws.onmessage = (event) => {
+        if (typeof event.data === 'string') {
+          const data = JSON.parse(event.data);
+          if (data.sender === '_ping') return; // keepalive, not a real exchange
+          appendLog(data.sender, data.text);
+        } else {
+          playAudio(event.data);
+        }
+      };
+
+      ws.onerror = () => { statusEl.textContent = 'সংযোগে সমস্যা হয়েছে।'; };
+      ws.onclose = () => { if (inCall) endCall(); };
+    }
+
+    function endCall() {
+      inCall = false;
+      if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
+      if (stream) stream.getTracks().forEach((t) => t.stop());
+      if (ws && ws.readyState === WebSocket.OPEN) ws.close();
+      btn.textContent = 'কল শুরু করুন (Start Call)';
+      btn.classList.remove('active');
+      statusEl.textContent = 'কল শেষ হয়েছে।';
+    }
+
+    btn.onclick = () => { inCall ? endCall() : startCall(); };
+  </script>
+</body>
+</html>

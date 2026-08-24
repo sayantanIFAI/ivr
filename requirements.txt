@@ -1,0 +1,16 @@
+# Run this ON TOP of voice-to-rx-repo's environment, not a fresh venv --
+# this service reuses its NeMo/IndicConformer install, its Silero VAD
+# cache, and its Ollama/Qwen2.5 instance. See README.md "Why this shares
+# an environment with voice-to-rx-repo".
+#
+# The only genuinely new dependency is httpx (async REST client, for the
+# Spring Boot tool calls and the TTS service call). Everything else below
+# is already on the pod per voice-to-rx-repo/setup_pod.sh; pinned here
+# too so this file is a complete record of what this service needs.
+
+httpx==0.27.0
+fastapi==0.104.1
+uvicorn[standard]
+torch==2.1.0
+torchaudio==2.1.0
+soundfile==0.12.1

@@ -11,6 +11,8 @@ were already that robust.
 """
 from __future__ import annotations
 
+import logging
+
 import datetime
 import difflib
 import uuid
@@ -20,12 +22,40 @@ from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from db import get_db
+from db import get_db, SessionLocal
 from models import Department, Doctor, DoctorSchedule, LabTest, Appointment
 
 app = FastAPI(title="Kolkata Care Diagnostics -- Clinic Data API (dummy)")
 
 SLOT_STEP_MIN = 15
+
+
+@app.on_event("startup")
+def _ensure_seeded():
+    """Create the schema, and seed it only if it is EMPTY.
+
+    The catalogue is derived data -- 8 departments, 32 doctors, 34 tests,
+    all defined in seed.py -- so regenerating it costs nothing and removes
+    the manual reseed step that every pod restart used to require.
+
+    Guarded on emptiness because seed() itself is destructive (drop_all
+    then create_all). Running it unconditionally at startup would wipe
+    every appointment booked since the last boot, turning a convenience
+    into data loss.
+    """
+    from db import engine
+    from models import Base, LabTest
+    Base.metadata.create_all(engine)
+    db = SessionLocal()
+    try:
+        if db.query(LabTest).count() == 0:
+            logging.getLogger("clinic-api").info("empty database -- seeding catalogue")
+            from seed import seed
+            seed()
+        else:
+            logging.getLogger("clinic-api").info("catalogue already present, not reseeding")
+    finally:
+        db.close()
 
 
 @app.get("/api/health")
@@ -58,6 +88,31 @@ def _test_reply_dict(t: LabTest) -> dict:
         "found": True, "test_name": t.name, "test_name_bn": _first_alias_bn(t.aliases_bn),
         "rate_inr": t.rate_inr,
         "sample_type": t.sample_type, "report_time_hours": t.report_time_hours,
+    }
+
+
+@app.get("/api/v1/catalogue")
+def catalogue(db: Session = Depends(get_db)):
+    """Every test and doctor with their Bengali aliases, in one call.
+
+    Exists for the voice agent's deterministic fast path: matching a
+    caller's words against a 74-row catalogue is a local string operation,
+    but only if the caller HAS the catalogue. Fetching it once at startup
+    turns "which test did they say" from a 7B-model inference into a
+    microsecond comparison -- see agent/fast_path.py.
+    """
+    return {
+        "tests": [
+            {"name": t.name,
+             "aliases_bn": [a for a in (t.aliases_bn or "").split("|") if a]}
+            for t in db.query(LabTest).all()
+        ],
+        "doctors": [
+            {"name": d.name,
+             "surname": d.name.split()[-1],
+             "aliases_bn": [a for a in (d.aliases_bn or "").split("|") if a]}
+            for d in db.query(Doctor).all()
+        ],
     }
 
 

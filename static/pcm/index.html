@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="bn">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Kolkata Care AI — PCM transport</title>
+  <style>
+    body { font-family: sans-serif; text-align: center; padding: 40px 16px; background: #f4f6f8; }
+    #micBtn { font-size: 18px; padding: 15px 30px; border-radius: 30px; border: none; cursor: pointer; background: #007bff; color: white; }
+    #micBtn.active { background: #dc3545; }
+    #micBtn:disabled { background: #9aa4ad; cursor: not-allowed; }
+    #status { margin-top: 14px; font-size: 14px; color: #555; min-height: 20px; }
+    #status.speaking { color: #b45309; font-weight: 600; }
+    #log { margin-top: 25px; white-space: pre-wrap; text-align: left; max-width: 600px; margin-inline: auto;
+           background: white; padding: 15px; border-radius: 8px; max-height: 45vh; overflow-y: auto; }
+    #warning { display: none; max-width: 600px; margin: 20px auto; background: #fff3cd; color: #664d03;
+               padding: 12px; border-radius: 8px; font-size: 14px; }
+    #note { max-width: 620px; margin: 14px auto 0; font-size: 12px; color: #6b7280; line-height: 1.6; }
+    .badge { display: inline-block; background: #0f766e; color: white; font-size: 11px; padding: 3px 9px;
+             border-radius: 999px; letter-spacing: .04em; vertical-align: middle; }
+    #diag { max-width: 620px; margin: 10px auto 0; font-size: 11px; color: #94a3b8; font-family: ui-monospace, monospace; }
+  </style>
+</head>
+<body>
+  <h2>কলকাতা কেয়ার ডায়াগনস্টিকস <span class="badge">PCM</span></h2>
+  <div id="warning"></div>
+  <button id="micBtn">কল শুরু করুন (Start Call)</button>
+  <div id="status">সিস্টেম প্রস্তুত...</div>
+  <div id="diag"></div>
+  <div id="log"></div>
+  <p id="note">
+    এই লাইনটি হাফ-ডুপ্লেক্স: AI যখন বলছে তখন আপনার মাইক বন্ধ থাকে, তাই মাঝপথে থামানো যাবে না।
+    AI-এর কথা শেষ হলে বলুন।
+  </p>
+
+  <script>
+    const btn = document.getElementById('micBtn');
+    const statusEl = document.getElementById('status');
+    const diagEl = document.getElementById('diag');
+    const log = document.getElementById('log');
+    const warningEl = document.getElementById('warning');
+
+    const TARGET_RATE = 16000;   // what Silero VAD and IndicConformer both want
+    const POST_PLAYBACK_GUARD_MS = 250;
+
+    let ws, stream, captureCtx, playbackCtx, workletNode, sourceNode, sinkNode;
+    let playQueue = Promise.resolve();
+    let pendingClips = 0;
+    let inCall = false;
+    let bytesSent = 0;
+
+    if (!window.AudioWorklet || !navigator.mediaDevices?.getUserMedia) {
+      warningEl.style.display = 'block';
+      warningEl.textContent =
+        'এই ব্রাউজারে AudioWorklet সাপোর্টেড নয়। Chrome, Edge, বা Firefox ব্যবহার করুন।';
+      btn.disabled = true;
+    }
+
+    function appendLog(sender, text) {
+      const line = document.createElement('div');
+      line.textContent = `[${sender}] ${text}`;
+      log.appendChild(line);
+      log.scrollTop = log.scrollHeight;
+    }
+
+    // enabled=false yields digital silence while keeping the track live, so
+    // the worklet keeps emitting blocks and the server's sample timeline
+    // advances at exactly real time. Stopping the node instead would make
+    // recorded-time and wall-clock diverge and every processed_until_s
+    // offset on the server would drift.
+    function setMicMuted(muted) {
+      if (!stream) return;
+      stream.getAudioTracks().forEach((t) => { t.enabled = !muted; });
+    }
+
+    function onPlaybackIdle() {
+      if (pendingClips !== 0 || !inCall) return;
+      setMicMuted(false);
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'playback_done' }));
+      }
+      statusEl.classList.remove('speaking');
+      statusEl.textContent = 'শুনছি...';
+    }
+
+    function playAudio(arrayBuffer) {
+      pendingClips += 1;
+      setMicMuted(true);
+      statusEl.classList.add('speaking');
+      statusEl.textContent = 'AI বলছে... (মাইক বন্ধ)';
+
+      playQueue = playQueue.then(() => new Promise(async (resolve) => {
+        try {
+          // Playback deliberately uses its OWN context at the device's
+          // native rate. Decoding the 22.05kHz TTS WAV through the 16kHz
+          // capture context would resample it down and throw away half the
+          // voice quality we just spent effort improving.
+          if (!playbackCtx) playbackCtx = new (window.AudioContext || window.webkitAudioContext)();
+          if (playbackCtx.state === 'suspended') await playbackCtx.resume();
+          const audioBuffer = await playbackCtx.decodeAudioData(arrayBuffer);
+          const source = playbackCtx.createBufferSource();
+          source.buffer = audioBuffer;
+          source.connect(playbackCtx.destination);
+          source.onended = resolve;
+          source.start();
+        } catch (e) {
+          console.error('audio decode failed', e);
+          resolve();
+        }
+      })).then(() => {
+        pendingClips -= 1;
+        if (pendingClips === 0) setTimeout(onPlaybackIdle, POST_PLAYBACK_GUARD_MS);
+      });
+    }
+
+    async function startCall() {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+        });
+      } catch (e) {
+        statusEl.textContent = 'মাইক্রোফোন ব্লক করা আছে: ' + e.message;
+        return;
+      }
+
+      // Ask for 16kHz directly so no resampling is needed anywhere. Browsers
+      // are allowed to ignore this; the actual rate is reported to the
+      // server in the hello frame and the server resamples if it differs,
+      // rather than silently producing a wrong timeline.
+      captureCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: TARGET_RATE });
+      if (captureCtx.state === 'suspended') await captureCtx.resume();
+
+      try {
+        await captureCtx.audioWorklet.addModule('pcm-worklet.js');
+      } catch (e) {
+        statusEl.textContent = 'অডিও মডিউল লোড হয়নি: ' + e.message;
+        return;
+      }
+
+      const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      ws = new WebSocket(`${wsProtocol}//${window.location.host}/ws/audio`);
+      ws.binaryType = 'arraybuffer';
+
+      ws.onopen = () => {
+        ws.send(JSON.stringify({
+          type: 'hello',
+          sampleRate: captureCtx.sampleRate,
+          format: 'pcm_s16le',
+          channels: 1,
+        }));
+
+        sourceNode = captureCtx.createMediaStreamSource(stream);
+        workletNode = new AudioWorkletNode(captureCtx, 'pcm-capture');
+        workletNode.port.onmessage = (e) => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(e.data);
+            bytesSent += e.data.byteLength;
+          }
+        };
+
+        // A worklet only runs while it is part of a live graph, so it has to
+        // reach the destination -- but routing the microphone to the
+        // speakers would create exactly the feedback loop this project
+        // already fought. Gain 0 keeps the graph alive and silent.
+        sinkNode = captureCtx.createGain();
+        sinkNode.gain.value = 0;
+        sourceNode.connect(workletNode);
+        workletNode.connect(sinkNode);
+        sinkNode.connect(captureCtx.destination);
+
+        inCall = true;
+        pendingClips = 0;
+        bytesSent = 0;
+        btn.textContent = 'কল শেষ করুন (End Call)';
+        btn.classList.add('active');
+        statusEl.textContent = 'শুনছি...';
+        diagEl.textContent = `transport: raw pcm_s16le @ ${captureCtx.sampleRate} Hz`;
+      };
+
+      ws.onmessage = (event) => {
+        if (typeof event.data === 'string') {
+          const data = JSON.parse(event.data);
+          if (data.sender === '_ping') return;
+          appendLog(data.sender, data.text);
+        } else {
+          playAudio(event.data);
+        }
+      };
+
+      ws.onerror = () => { statusEl.textContent = 'সংযোগে সমস্যা হয়েছে।'; };
+      ws.onclose = () => { if (inCall) endCall(); };
+    }
+
+    function endCall() {
+      inCall = false;
+      pendingClips = 0;
+      setMicMuted(false);
+      try { sourceNode && sourceNode.disconnect(); } catch (e) { /* already torn down */ }
+      try { workletNode && workletNode.disconnect(); } catch (e) { /* already torn down */ }
+      try { sinkNode && sinkNode.disconnect(); } catch (e) { /* already torn down */ }
+      if (captureCtx) { captureCtx.close(); captureCtx = null; }
+      if (stream) stream.getTracks().forEach((t) => t.stop());
+      if (ws && ws.readyState === WebSocket.OPEN) ws.close();
+      btn.textContent = 'কল শুরু করুন (Start Call)';
+      btn.classList.remove('active');
+      statusEl.classList.remove('speaking');
+      statusEl.textContent = 'কল শেষ হয়েছে।';
+      diagEl.textContent = `sent ${(bytesSent / 1024).toFixed(0)} KB raw PCM`;
+    }
+
+    btn.onclick = () => { inCall ? endCall() : startCall(); };
+  </script>
+</body>
+</html>

@@ -1,4 +1,19 @@
-"""Kolkata Care Diagnostics -- Bengali voice agent, WebSocket orchestrator.
+"""Kolkata Care Diagnostics -- voice agent on the RAW PCM transport.
+
+GENERATED FILE -- do not edit directly. Produced by
+tools/make_pcm_variant.py from main.py; edit main.py and re-run that.
+
+This variant changes only the TRANSPORT (how audio arrives and how the
+turn detector reads it):
+  * No ffmpeg, no WebM, no temp audio files, no subprocess per poll.
+  * Appending is O(chunk) and reading the tail is O(tail), where the WebM
+    path was O(call length) EVERY poll -- O(T^2) per call.
+  * The sample index IS the timeline, exactly, so processed_until_s
+    cannot drift away from real time.
+See agent/pcm_buffer.py for the argument and the arithmetic.
+
+----------------------------------------------------------------------
+
 
 Turn loop, once a caller's utterance is judged complete (agent/vad_stream.py):
 
@@ -61,6 +76,7 @@ import uuid
 import wave
 
 import torchaudio
+from agent.pcm_buffer import PcmCallBuffer, SAMPLE_RATE
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 
@@ -193,42 +209,26 @@ def _wav_duration_s(wav_bytes: bytes) -> float:
         return 5.0
 
 
-async def _decode_to_wav(raw_path: str, wav_path: str) -> bool:
-    """Re-decode the WHOLE growing webm buffer every poll -- same choice
-    server.py makes for the consultation recorder, and for the same reason:
-    MediaRecorder only puts the container header on the FIRST chunk, so
-    later chunks are not independently decodable, and re-decoding a few
-    seconds of audio is cheap next to ASR+LLM+TTS.
-
-    NOTE the cost profile: this is O(call length) on every poll, so the
-    work per poll grows for the whole duration of a call. Fine for a
-    handful of concurrent bench calls; it is the first thing that has to
-    change for real concurrency (see README.md "Scaling")."""
-    proc = await asyncio.create_subprocess_exec(
-        "ffmpeg", "-y", "-loglevel", "error", "-i", raw_path,
-        "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", wav_path,
-        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-    )
-    await proc.wait()
-    return proc.returncode == 0 and os.path.exists(wav_path) and os.path.getsize(wav_path) > 44
-
-
 class CallSession:
-    """One raw/decoded buffer for the ENTIRE call, not one per turn.
+    """One PCM buffer for the ENTIRE call, and a marker for how much of it
+    has been consumed.
 
-    An earlier version deleted the buffer and started a fresh file after
-    every completed turn. That broke on real testing: MediaRecorder only
-    puts the WebM container's header in the very first chunk of the whole
-    recording session -- every chunk after a mid-call "reset" was being
-    appended to a file that could never be decoded, because its one valid
-    header lived in the turn-1 file that had already been deleted. Every
-    turn after the first silently failed to decode, forever, for the rest
-    of the call.
+    The continuous-buffer design is inherited from the WebM version, where
+    it was forced: MediaRecorder puts the container header only in the
+    first chunk, so resetting the buffer mid-call produced audio that
+    could never be decoded again. That constraint is GONE here -- raw PCM
+    has no header and any byte range is independently valid.
 
-    Fixed the same way voice-to-rx-repo/server.py already had to: keep
-    ONE continuous file for the whole call and track `processed_until_s`
-    -- a marker for how much of it a prior turn has already consumed.
-    Each poll only ever looks at the UNPROCESSED TAIL past that marker.
+    It is kept anyway, because the second reason for it was always the
+    better one: `processed_until_s` gives every turn an absolute,
+    monotonic position on one call-long timeline. Silero's segment
+    boundaries move as more audio arrives, so a turn detector run against
+    a buffer that keeps restarting drops any utterance straddling the
+    seam. Each poll therefore looks only at the UNPROCESSED TAIL.
+
+    What PCM changes is the cost and the accuracy of that lookup: the tail
+    is a slice rather than a full re-decode, and sample index maps to
+    wall-clock exactly, so the timeline cannot drift.
     """
 
     def __init__(self, ws: WebSocket):
@@ -240,9 +240,8 @@ class CallSession:
         self.processed_until_s = 0.0
         self.utt_seq = 0
         self.last_heartbeat = time.time()
-        self.raw_path = os.path.join(self.tmpdir, "call.webm")
-        self.wav_path = self.raw_path + ".wav"
-        open(self.raw_path, "wb").close()
+        self.audio = PcmCallBuffer()
+        self.declared_rate: int | None = None
 
         # Starts True: the greeting goes out before the caller has said
         # anything, so the gate must already be closed when the first poll
@@ -267,8 +266,7 @@ class CallSession:
 
     async def append(self, chunk: bytes):
         self.last_activity = time.time()
-        with open(self.raw_path, "ab") as f:
-            f.write(chunk)
+        self.audio.append(chunk)
 
     async def send_json(self, sender: str, text: str):
         await self.ws.send_text(json.dumps({"sender": sender, "text": text}, ensure_ascii=False))
@@ -301,11 +299,22 @@ async def _speak(session: CallSession, text_bn: str, fallback_reason: str | None
 async def _slice_utterance(session: CallSession, start_s: float, end_s: float, seq: int) -> str:
     """Cuts [start_s, end_s+pad] -- both ABSOLUTE call-time offsets -- out
     of the call's decoded WAV into its own small file for ASR."""
-    wav, sr = await asyncio.to_thread(torchaudio.load, session.wav_path)
-    a = max(0, int(start_s * sr))
-    b = min(int((end_s + UTTERANCE_PAD_S) * sr), wav.shape[-1])
-    clip_path = f"{session.wav_path}.utt{seq}.wav"
-    await asyncio.to_thread(torchaudio.save, clip_path, wav[:, a:b], sr)
+    sr = session.audio.sample_rate
+    clip = session.audio.slice_tensor(start_s, end_s + UTTERANCE_PAD_S)
+    clip_path = os.path.join(session.tmpdir, f"utt{seq}.wav")
+
+    def _write():
+        wav = clip.unsqueeze(0)
+        out_sr = sr
+        if sr != SAMPLE_RATE:
+            # Only reachable when the browser refused a 16kHz AudioContext.
+            # ASR expects 16k, so convert here rather than letting it
+            # silently transcribe pitch-shifted audio.
+            wav = torchaudio.functional.resample(wav, sr, SAMPLE_RATE)
+            out_sr = SAMPLE_RATE
+        torchaudio.save(clip_path, wav, out_sr)
+
+    await asyncio.to_thread(_write)
     return clip_path
 
 
@@ -412,10 +421,7 @@ async def _resync_after_playback(session: CallSession) -> bool:
     detector from ever analysing it, and -- more importantly -- keeps
     processed_until_s anchored to real time instead of drifting a full
     reply behind, which is what made later turns surface late."""
-    if not await _decode_to_wav(session.raw_path, session.wav_path):
-        return False
-    wav, sr = await asyncio.to_thread(torchaudio.load, session.wav_path)
-    buffer_end_s = wav.shape[-1] / sr
+    buffer_end_s = session.audio.duration_s
     session.processed_until_s = max(session.processed_until_s,
                                     buffer_end_s - RESYNC_REWIND_S)
     session.resync_pending = False
@@ -460,14 +466,10 @@ async def _turn_poll_loop(session: CallSession):
             await _resync_after_playback(session)
             continue
 
-        if not await _decode_to_wav(session.raw_path, session.wav_path):
-            continue  # too little data yet to form a valid container -- not an error
-
-        wav, sr = await asyncio.to_thread(torchaudio.load, session.wav_path)
-        wav = wav.mean(dim=0) if wav.shape[0] > 1 else wav.squeeze(0)
-
-        tail_start_sample = min(int(session.processed_until_s * sr), wav.shape[-1])
-        tail = wav[tail_start_sample:]
+        sr = session.audio.sample_rate
+        tail = session.audio.tail_tensor(session.processed_until_s)
+        if tail.numel() < int(0.2 * sr):
+            continue  # not enough new audio to judge yet -- not an error
 
         result = await asyncio.to_thread(_turn_detector.poll, tail, sr)
         if result.utterance_end_s is None:
@@ -493,6 +495,19 @@ async def _handle_control(session: CallSession, raw: str):
         return
     if msg.get("type") == "playback_done":
         session.release_gate()
+    elif msg.get("type") == "hello":
+        # The browser may refuse the 16kHz AudioContext we ask for. Trust
+        # what the client reports over what we requested: a wrong assumed
+        # rate would not fail loudly, it would just make every timestamp
+        # and every transcript quietly wrong.
+        rate = int(msg.get("sampleRate") or SAMPLE_RATE)
+        session.declared_rate = rate
+        session.audio.sample_rate = rate
+        if rate != SAMPLE_RATE:
+            logger.warning("[%s] client capturing at %dHz, not %dHz -- resampling per utterance",
+                           session.call_id, rate, SAMPLE_RATE)
+        logger.info("[%s] transport: %s @ %dHz", session.call_id,
+                    msg.get("format", "pcm_s16le"), rate)
 
 
 @app.websocket("/ws/audio")
@@ -524,4 +539,4 @@ async def ws_audio(ws: WebSocket):
         logger.info("[%s] call ended", session.call_id)
 
 
-app.mount("/", StaticFiles(directory="static", html=True), name="static")
+app.mount("/", StaticFiles(directory="static/pcm", html=True), name="static")
